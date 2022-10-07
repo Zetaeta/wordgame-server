@@ -3,6 +3,9 @@
 module Main (main) where
 
 import Prelude hiding (log)
+import Game
+import Serialize
+import Codenames
 
 import Control.Monad (unless, forever, void)
 import Control.Concurrent
@@ -13,13 +16,11 @@ import Control.Monad.Reader
 import System.IO
 import System.Directory
 import Text.Read (readMaybe)
-import System.Random (randomRIO)
 import qualified Data.ByteString.Lazy as LS hiding (unpack)
 import qualified Data.ByteString.Lazy.Char8 as LS
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS
 import Data.Map (Map)
-import qualified Data.HashMap.Strict as HM
 import Data.List.Split (splitOn)
 import Data.List (splitAt, sort)
 --import Data.Text hiding (length, splitOn, map, filter)
@@ -32,182 +33,9 @@ import qualified Network.WebSockets as WS
 import Network.Socket.ByteString (recv)
 import Data.Aeson
 import Data.Aeson.TH
-
-type PlayerId = Int
-type PlayerName = Text
-
-data Clue = Clue { clwd :: Text, shown :: Bool } deriving (Show, Eq)
-
-type Clues = Map PlayerId Clue
-type ShownClues = Map PlayerId Text
-
---type WordSource = String
---
-type Colour = Int
-
-data MsgIn = Join { jname :: Text }
-           | StatusReq
-           | NextTurn
-           | NextPhase GamePhase
-           | SubmitClue Text
-           | SubmitGuess Text
-           | ClueVis PlayerId Bool
-           | Ready
-           | Quit
-           | RemovePlayer PlayerId
-           | SetSource WordSource
-           | SetColourMI Colour
-           | ReqWordFiles
-           | AskWord
-           | ChatMI Text
-             deriving (Show, Eq)
-
-data FileWgt = FileWgt { filename :: String, weight :: Int } deriving (Show, Eq)
-
-fileWgt = FileWgt
-
-type WordSource = [FileWgt]
-
-data MsgOut = ShowWord
-            | StatusUpd { self :: Player
-                        , all :: [PubStatus]
-                        , suphase :: GamePhase
-                        , suguesser :: Maybe Text
-                        , private :: PersStatus
-                        , sourceOfWord :: Maybe Text
-                        , susettings :: GameSettings }
-            | ErrorMsg Text
-            | IntlPlayerData PlayerData
-            | Removed
-            | GiveWord Text
-            | SetColourMO PlayerName Colour
-            | SendWordSource WordSource
-            | SendColours (Map PlayerName Colour)
-            | ChatMO { from :: Text, content :: Text}
-              deriving (Show, Eq)
-
-instance FromJSON MsgIn where
-    parseJSON (Object msg) = do
-        tp <- msg .: "msgtype"
-        case (tp :: Text) of
-            "join" -> Join <$> msg .: "name"
-            "statusreq" -> return StatusReq
-            "nextturn" -> return NextTurn
-            "nextphase" -> NextPhase <$> msg .: "currphase"
-            "sendclue" -> SubmitClue <$> msg .: "clue"
-            "sendguess" -> SubmitGuess <$> msg .: "guess"
-            "cluevis" -> ClueVis <$> msg .: "playerid" <*> msg .: "visible"
-            "ready" -> return Ready
-            "quit" -> return Quit
-            "getword" -> return AskWord
-            "reqwordfiles" -> return ReqWordFiles
-            "setsource" -> SetSource <$> msg .: "source"
-            "setcolour" -> SetColourMI <$> msg .: "colour"
-            "remplr" -> RemovePlayer <$> msg .: "id"
-            "chat" -> ChatMI <$> msg .: "text"
-
-t :: Text -> Text
-t = id
-
-instance ToJSON MsgOut where
-    toJSON ShowWord = object []
-    toJSON (StatusUpd slf pls phs gsr pstat src settings) = object ["msgtype" .= t "status",
-        "self" .= slf, "players" .= pls, "guesser" .= gsr, "phase" .= phs, "pers_status" .= pstat, "source" .= src, "settings" .= settings ]
-    toJSON Removed = object ["msgtype" .= t "removed"]
-    toJSON (ErrorMsg e) = object ["msgtype" .= t "error", "msg" .= e]
-    toJSON (GiveWord w) = object ["msgtype" .= t "giveword", "word" .= w]
-    toJSON (ChatMO p c) = object ["msgtype".= t "chat", "text" .= c, "from" .= p]
-    toJSON (SetColourMO p c) = object ["msgtype".= t "setcolour", "colour" .= c, "player" .= p]
-    toJSON (SendWordSource fs) = object ["msgtype".= t "wordsource", "source" .= fs]
-    toJSON (SendColours cls) = object ["msgtype".= t "allcolours", "colours" .= cls]
-
-instance ToJSON Clue where
-    toJSON (Clue w s) = object ["word".= w, "shown" .= s]
-
-instance ToJSON Player where
-    toJSON (Player i n g r) = object ["id".= i, "name" .= n, "is_gm" .= g, "ready" .= r]
-
-addTo (Object o) l = Object . HM.union o . (\(Object x) -> x) $ object l
-
-instance ToJSON PubStatus where
-    toJSON (Guesser p) = addTo (toJSON p) ["role" .= t "guess"]
-    toJSON (ClueMaker p) = addTo (toJSON p) ["role" .= t "clue"]
-
-instance ToJSON PersStatus where
-    toJSON (Guessing sc) = object ["role" .= t "guess", "clues" .= sc ]
-    toJSON (ClueMaking w m c) =  object ["role" .= t "clue", "word" .= w, "myclue" .= m, "clues" .= c]
-    toJSON (Unspecified w c g) =  object ["word" .= w, "clues" .= c, "guess" .= g]
-
-instance ToJSON GamePhase where
-    toJSON = String . pack . show
-
-instance FromJSON GamePhase where
-    parseJSON (String s) = case readMaybe (unpack s) of
-        (Just p) -> return p
-        Nothing -> fail "not a phase"
-    parseJSON _ = fail "not a string"
+import qualified Data.HashMap.Strict as HM
 
 
-
-data PubStatus = Guesser { psplayer :: Player }
-                | ClueMaker { psplayer :: Player}
-                  deriving (Show, Eq)
-
-data PersStatus = Guessing (Maybe ShownClues)
-                | ClueMaking { psword :: Text, psmyclue :: Maybe Text, psclues :: Clues }
-                | Unspecified { psword :: Text, psclues :: Clues, psguess :: Text }
-                  deriving (Show, Eq)
-
-data PlayerData = PD {player :: Player, messages :: Chan MsgOut } --deriving (Show)
-
-instance Show PlayerData where
-    show p = "PlayerData { " ++ show (player p) ++ "}"
-
-instance Eq PlayerData where 
-    p == q = player p == player q
-
-instance Ord PlayerData where 
-    p <= q = player p <= player q
-
-data Player = Player { pid:: PlayerId, name :: Text, gm :: Bool, ready :: Bool} deriving (Show)
-
-instance Eq Player where 
-    p == q = pid p == pid q
-
-instance Ord Player where 
-    p <= q = pid p <= pid q
-
-data PlayerMsg = NewPlayer Text (Chan MsgOut)
-               | PlayerMsg PlayerData MsgIn
-
-data GameState = GS { players :: [PlayerData]
-                    , whoseTurn :: PlayerId
-                    , phase :: GamePhase
-                    , word :: Text
-                    , guess :: Text
-                    , wordSource :: WordSource
-                    , thisSource :: Text
-                    , clues :: Map PlayerId Clue
-                    , settings :: GameSettings
-                    , colours :: Map PlayerName Colour} --deriving (Show)
-
-data GameSettings = GameSettings { showSource :: Bool } deriving (Show, Eq)
-
-data GamePhase = Prelim
-               | MakeClues
-               | InspectClues
-               | MakeGuess
-               | Complete deriving (Show, Eq, Read)
-
-type Game a = ReaderT (Chan String) (StateT GameState IO) a
-type Log = Chan String
-
-type Logger a = ReaderT Log IO a
-
-log :: (MonadIO m, MonadReader Log m) => String -> m ()
-log s = do
-    c <- ask
-    liftIO $ writeChan c s 
 
 updateWordSource_ :: WordSource -> IO WordSource
 updateWordSource_ ws = do
@@ -255,10 +83,6 @@ getPlayerId n = do
             return (-1)
 
 
-send :: PlayerData -> MsgOut -> Game ()
-send p m = liftIO $ writeChan (messages p) m
-
-randomElt l = (l !!) <$> randomRIO (0, length l -1)
 
 getBoard :: Game [Text]
 getBoard = (take 25 . (foldl remDups [])) <$> (sequence $ repeat getWord)
@@ -268,15 +92,6 @@ getBoard = (take 25 . (foldl remDups [])) <$> (sequence $ repeat getWord)
                         then ys
                         else ys ++ [x]
 
-getWord :: Game Text
-getWord = do
-    src <- wordSource <$> get
-    srcFile <- liftIO $ randomElt . foldl (++) [] $ map (\fw  -> replicate (weight fw) (filename fw)) src
-    modify $ \s -> s {thisSource = pack srcFile}
-    liftIO $ do
-        file <-  openFile ("words/" ++ srcFile) ReadMode
-        words <- filter (not . null) . splitOn "\n" <$> hGetContents file
-        pack <$> randomElt words
 
 allCluesSubmitted :: Game Bool
 allCluesSubmitted = do
@@ -307,11 +122,16 @@ nextTurn = do
     wd <- getWord
     modify $ \s -> s { word = wd, phase = MakeClues , clues = M.empty}
 
-gameserver :: Chan PlayerMsg -> Game ()
-gameserver chan = do 
+newTurn = do
+    setAllReady False
+    wd <- getWord
+    modify $ \s -> s { word = wd, phase = MakeClues , clues = M.empty}
+
+gameserver :: Chan (PlayerData, CNMsg) -> Chan PlayerMsg -> Game ()
+gameserver codechan chan = do 
     pmsg <- liftIO $ readChan chan
     handlePMsg pmsg
-    gameserver chan
+    gameserver codechan chan
   where
     handlePMsg :: PlayerMsg -> Game ()
     handlePMsg (NewPlayer n c) = do
@@ -328,6 +148,9 @@ gameserver chan = do
     handleMsg plr (NextPhase p) = do
         curr <- phase <$> get 
         when (curr == p) nextPhase
+        broadcastState
+    handleMsg plr NewWord = do
+        newTurn
         broadcastState
     handleMsg plr AskWord = do
         word <- getWord
@@ -393,6 +216,11 @@ gameserver chan = do
             removePlayer plr
             broadcastState
           Nothing -> send plr $ ErrorMsg "no such player"
+    handleMsg plr (AskCard s) = send plr $ GiveCard (newCard s)
+    handleMsg plr (NewBoard bid) = do
+        board <- newBoard bid
+        liftIO $ writeChan codechan (plr, NewB board)
+    handleMsg plr rest = liftIO $ writeChan codechan (plr, OthrM rest)
 
 validateFW plr (FileWgt _ w)
     | w < 0 = send plr (ErrorMsg "negative weight") >> return False
@@ -517,10 +345,12 @@ readMsg hdl = do
 
 writeMsg :: MsgOut -> Handle -> Logger ()
 writeMsg m h = do
+    log "writeMsg"
     let msgstr = encode m
     log $ "to send: " ++ show m
 --    log . LS.unpack $ "\nsending '" <> msgstr <> "'\n"
     liftIO $ LS.hPutStrLn h msgstr
+    log  "sent!" 
 
 receive :: Chan PlayerMsg -> Log-> Socket -> IO ()
 receive mainChan l sock = do
@@ -562,7 +392,9 @@ main = do
     gs <- newGameState
     pchan <- newChan
     forkIO $ printer pchan 
-    forkIO $ runGame (gameserver mchan) gs pchan
+    codechan <- newChan
+    forkIO $ runBoards (boardHandler codechan) pchan
+    forkIO $ runGame (gameserver codechan mchan) gs pchan
     writeChan pchan "starting websock server"
     forkIO $ WS.runServer "0.0.0.0" 3001 $ wsServer pchan
     writeChan pchan "starting TCP server"
@@ -579,5 +411,3 @@ main = do
 --          sendAll s msg
 --          talk s
 
-$(deriveJSON defaultOptions ''FileWgt)
-$(deriveJSON defaultOptions ''GameSettings)
